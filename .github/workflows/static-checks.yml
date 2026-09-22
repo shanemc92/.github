@@ -21,6 +21,14 @@ on:
         type: boolean
         required: false
         default: false
+      allow-off-origin:
+        description: >-
+          Skip the "no off-origin <script src> / <link href>" check. Set this
+          only for a tool that genuinely depends on a third party at runtime
+          and cannot vendor it, and say why in the calling workflow.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -63,6 +71,7 @@ jobs:
       - name: Check HTML for off-origin assets and a CSP meta tag
         env:
           SKIP_CSP_CHECK: ${{ inputs.skip-csp-check }}
+          ALLOW_OFF_ORIGIN: ${{ inputs.allow-off-origin }}
         shell: python
         run: |
           """Stdlib only, no pip install, no third-party action.
@@ -80,6 +89,7 @@ jobs:
           from html.parser import HTMLParser
 
           SKIP_CSP = os.environ.get("SKIP_CSP_CHECK", "false").lower() == "true"
+          ALLOW_OFF_ORIGIN = os.environ.get("ALLOW_OFF_ORIGIN", "false").lower() == "true"
 
           # Anything with a scheme or protocol-relative prefix is off-origin.
           OFF_ORIGIN = re.compile(r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?//")
@@ -135,7 +145,10 @@ jobs:
                   if INLINE.match(url):
                       continue
                   if OFF_ORIGIN.match(url):
-                      failures.append("%s:%d: off-origin %s -> %s" % (path, line, kind, url))
+                      if ALLOW_OFF_ORIGIN:
+                          print("allowed off-origin %s:%d %s -> %s" % (path, line, kind, url))
+                      else:
+                          failures.append("%s:%d: off-origin %s -> %s" % (path, line, kind, url))
 
           if not SKIP_CSP:
               for name in ("index.html", "index.htm"):
@@ -159,7 +172,7 @@ jobs:
               for f in failures:
                   print("FAIL %s" % f)
               sys.exit(1)
-          print("OK: no off-origin script/link tags, CSP meta present where required")
+          print("OK: asset origins and CSP meta are as expected")
 
   shellcheck:
     name: shellcheck
