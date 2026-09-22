@@ -58,6 +58,20 @@ jobs:
           sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
           gitleaks version
 
+      # False positives are handled with a .gitleaks.toml in the repo being
+      # scanned, which gitleaks picks up automatically. Two shapes have come up
+      # so far, both worth copying rather than reinventing:
+      #
+      #   - a vendored minified bundle, where generic-api-key scores library
+      #     identifiers as high-entropy assignments. See cert-tool, which
+      #     matches the bundle's opening bytes rather than a line number or a
+      #     commit fingerprint, because both go stale when the file moves.
+      #   - fixture files that contain fake secrets on purpose, such as sample
+      #     input for a redaction tool. See scrub-adub, which scopes the
+      #     allowlist to examples/.
+      #
+      # Allowlist the specific shape, keep useDefault = true, and say in the
+      # description why the match is safe. Do not drop a rule or skip the job.
       - name: Scan full history
         run: gitleaks git --no-banner --redact --verbose .
 
