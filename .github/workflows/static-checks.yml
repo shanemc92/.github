@@ -1,0 +1,184 @@
+# Reusable static checks for the single-file tools and small apps in this account.
+#
+# Call it from a repo with:
+#
+#   jobs:
+#     checks:
+#       uses: shanemc92/.github/.github/workflows/static-checks.yml@main
+#
+# Third-party actions are pinned to a full commit SHA, not a tag. A tag is a
+# moving pointer that the action's owner can repoint at any time; a SHA cannot
+# be changed under us.
+name: static-checks
+
+on:
+  workflow_call:
+    inputs:
+      skip-csp-check:
+        description: >-
+          Skip the "top-level index.html must carry a CSP meta tag" check.
+          Set this for a repo where that is deliberately not true.
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 because the point is to scan the whole history, not the
+      # tip. A secret that was committed and then removed is still in the pack.
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # The release binary rather than the marketplace action: one less
+      # third-party action in the supply chain, and the version is explicit.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL "$url" -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Scan full history
+        run: gitleaks git --no-banner --redact --verbose .
+
+  html-check:
+    name: html-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check HTML for off-origin assets and a CSP meta tag
+        env:
+          SKIP_CSP_CHECK: ${{ inputs.skip-csp-check }}
+        shell: python
+        run: |
+          """Stdlib only, no pip install, no third-party action.
+
+          Two checks:
+            1. No *.html file may load a script or stylesheet from another
+               origin. These tools are meant to be self-contained; a CDN tag is
+               a third party that can run code in the page.
+            2. A top-level index.html must carry a Content-Security-Policy meta
+               tag, unless the caller passes skip-csp-check.
+          """
+          import os
+          import re
+          import sys
+          from html.parser import HTMLParser
+
+          SKIP_CSP = os.environ.get("SKIP_CSP_CHECK", "false").lower() == "true"
+
+          # Anything with a scheme or protocol-relative prefix is off-origin.
+          OFF_ORIGIN = re.compile(r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?//")
+          # data: and blob: are inline payloads, not another origin.
+          INLINE = re.compile(r"^(?:data|blob):", re.I)
+
+          SKIP_DIRS = {".git", "node_modules", "vendor/.git"}
+
+
+          class AssetFinder(HTMLParser):
+              """Collects <script src> and <link href>.
+
+              HTMLParser hands comments to handle_comment rather than
+              handle_starttag, so a commented-out tag never reaches us. That is
+              what makes this "non-commented" without any regex gymnastics.
+              """
+
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.assets = []
+
+              def handle_starttag(self, tag, attrs):
+                  a = dict(attrs)
+                  if tag == "script" and a.get("src"):
+                      self.assets.append(("script src", a["src"], self.getpos()[0]))
+                  elif tag == "link" and a.get("href"):
+                      self.assets.append(("link href", a["href"], self.getpos()[0]))
+
+
+          def html_files():
+              for root, dirs, files in os.walk("."):
+                  dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".git")]
+                  for name in sorted(files):
+                      if name.lower().endswith((".html", ".htm")):
+                          yield os.path.join(root, name)
+
+
+          failures = []
+          checked = 0
+
+          for path in html_files():
+              checked += 1
+              with open(path, encoding="utf-8", errors="replace") as fh:
+                  text = fh.read()
+              parser = AssetFinder()
+              try:
+                  parser.feed(text)
+              except Exception as exc:  # a malformed file should be loud, not silent
+                  failures.append("%s: could not parse (%s)" % (path, exc))
+                  continue
+              for kind, url, line in parser.assets:
+                  url = url.strip()
+                  if INLINE.match(url):
+                      continue
+                  if OFF_ORIGIN.match(url):
+                      failures.append("%s:%d: off-origin %s -> %s" % (path, line, kind, url))
+
+          if not SKIP_CSP:
+              for name in ("index.html", "index.htm"):
+                  if os.path.isfile(name):
+                      with open(name, encoding="utf-8", errors="replace") as fh:
+                          head = fh.read()
+                      if not re.search(
+                          r"""<meta[^>]+http-equiv\s*=\s*["']?content-security-policy""",
+                          head,
+                          re.I,
+                      ):
+                          failures.append(
+                              "%s: no Content-Security-Policy meta tag "
+                              "(pass skip-csp-check: true if that is intended)" % name
+                          )
+                      break
+
+          print("checked %d HTML file(s)" % checked)
+          if failures:
+              print("")
+              for f in failures:
+                  print("FAIL %s" % f)
+              sys.exit(1)
+          print("OK: no off-origin script/link tags, CSP meta present where required")
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run shellcheck on any *.sh present
+        run: |
+          set -euo pipefail
+          # -print0/-d '' so a path with a space cannot split into two arguments.
+          mapfile -d '' -t scripts < <(find . -path ./.git -prune -o -name '*.sh' -type f -print0)
+          if [ "${#scripts[@]}" -eq 0 ]; then
+            echo "No *.sh files in this repo, nothing to check."
+            exit 0
+          fi
+          printf 'Checking %d script(s):\n' "${#scripts[@]}"
+          printf '  %s\n' "${scripts[@]}"
+          # shellcheck is preinstalled on ubuntu-latest runners.
+          shellcheck --version
+          shellcheck -S warning "${scripts[@]}"
